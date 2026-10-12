@@ -16,17 +16,40 @@ const (
 	writeTimeout   = 30 * time.Second
 )
 
-// Serve owns listener and closes it and all active connections on return.
-// An optional AOF path enables recovery and synchronous persistence; omitting
-// it retains the in-memory API used by embedded callers and tests.
+// Options configures storage accounting and persistence. MaxBytes is a logical
+// storage budget, not a limit on process memory. Zero leaves it unlimited.
+type Options struct {
+	AOFPath      string
+	SnapshotPath string // empty defaults to AOFPath + ".snap" when AOF is enabled
+	MaxBytes     int64
+}
+
+// Serve retains the optional-AOF API for existing embedded callers.
 func Serve(ctx context.Context, listener net.Listener, aofPath ...string) error {
-	data := newStore()
 	if len(aofPath) > 1 {
 		listener.Close()
 		return errors.New("expected at most one AOF path")
 	}
+	options := Options{}
 	if len(aofPath) == 1 {
-		journal, recovered, err := openAOF(aofPath[0])
+		options.AOFPath = aofPath[0]
+	}
+	return ServeWithOptions(ctx, listener, options)
+}
+
+// ServeWithOptions owns listener and closes it and all connections on return.
+func ServeWithOptions(ctx context.Context, listener net.Listener, options Options) error {
+	if options.MaxBytes < 0 || (options.SnapshotPath != "" && options.AOFPath == "") {
+		listener.Close()
+		return errors.New("invalid storage limit or snapshot without AOF")
+	}
+	data := newStore()
+	data.maxBytes = options.MaxBytes
+	if options.AOFPath != "" {
+		if options.SnapshotPath == "" {
+			options.SnapshotPath = options.AOFPath + ".snap"
+		}
+		journal, recovered, err := openPersistence(options.AOFPath, options.SnapshotPath, options.MaxBytes)
 		if err != nil {
 			listener.Close()
 			return err

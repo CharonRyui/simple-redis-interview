@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -255,15 +256,28 @@ func TestAOFProcessHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Println(listener.Addr().String())
-	if err := Serve(context.Background(), listener, path); err != nil {
+	var options Options
+	options.AOFPath = path
+	if limit := os.Getenv("MINI_REDIS_TEST_LIMIT"); limit != "" {
+		options.MaxBytes, err = strconv.ParseInt(limit, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ServeWithOptions(context.Background(), listener, options); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func launchAOFProcess(t *testing.T, path string) (string, func()) {
+	return launchAOFProcessEnv(t, path)
+}
+
+func launchAOFProcessEnv(t *testing.T, path string, env ...string) (string, func()) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestAOFProcessHelper$")
 	cmd.Env = append(os.Environ(), "MINI_REDIS_TEST_AOF="+path)
+	cmd.Env = append(cmd.Env, env...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -319,6 +333,7 @@ func TestAcknowledgedWritesSurviveSIGKILL(t *testing.T) {
 		{[]string{"HSET", "deleted", "f", "v"}, ":1\r\n"},
 		{[]string{"DEL", "deleted"}, ":1\r\n"},
 		{[]string{"HSET", "last-field", "f", "v"}, ":1\r\n"},
+		{[]string{"SAVE"}, "+OK\r\n"},
 		{[]string{"HDEL", "last-field", "f"}, ":1\r\n"},
 	}
 	for _, step := range steps {
@@ -340,6 +355,7 @@ func TestAcknowledgedWritesSurviveSIGKILL(t *testing.T) {
 		{[]string{"HLEN", "deleted"}, ":0\r\n"},
 		{[]string{"DEL", "last-field"}, ":0\r\n"},
 		{[]string{"HSET", "after-restart", "f", "v"}, ":1\r\n"},
+		{[]string{"SAVE"}, "+OK\r\n"},
 	} {
 		if _, err := io.WriteString(conn, request(step.args...)); err != nil {
 			t.Fatal(err)

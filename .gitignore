@@ -1,2 +1,4 @@
 /appendonly.aof
+/appendonly.aof.snap
+/.mini-redis-snapshot-*
 /mini-redis

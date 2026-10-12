@@ -21,6 +21,7 @@ type journal interface {
 
 type logFile interface {
 	io.Reader
+	io.ReaderAt
 	io.Writer
 	io.Seeker
 	Truncate(int64) error
@@ -31,6 +32,15 @@ type logFile interface {
 type aof struct{ file logFile }
 
 func openAOF(path string) (*aof, *store, error) {
+	return openPersistence(path, "", 0)
+}
+
+func openPersistence(path, snapshotPath string, maxBytes int64) (*aof, *store, error) {
+	if snapshotPath != "" {
+		if err := checkSnapshotPaths(path, snapshotPath); err != nil {
+			return nil, nil, err
+		}
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, nil, err
@@ -69,20 +79,32 @@ func openAOF(path string) (*aof, *store, error) {
 	}
 	data := newStore()
 	log := &aof{file: f}
+	if snapshotPath != "" {
+		if err := log.loadSnapshot(snapshotPath, data); err != nil {
+			return fail(err)
+		}
+	}
 	if err := log.replay(data); err != nil {
 		return fail(err)
 	}
+	if maxBytes > 0 && data.usedBytes > maxBytes {
+		return fail(fmt.Errorf("recovered storage uses %d bytes, exceeds limit %d", data.usedBytes, maxBytes))
+	}
+	data.maxBytes = maxBytes
 	data.journal = log
+	if snapshotPath != "" {
+		data.save = func(s *store) error { return log.saveSnapshot(snapshotPath, s) }
+	}
 	return log, data, nil
 }
 
 func (a *aof) replay(data *store) error {
-	offset := int64(len(aofMagic))
+	offset, err := a.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
 	for {
-		// Header checksum protects the length itself, so a corrupt length cannot
-		// be mistaken for a safely discardable unfinished payload.
-		var header [12]byte
-		_, err := io.ReadFull(a.file, header[:])
+		args, size, err := readRecord(a.file)
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -90,27 +112,12 @@ func (a *aof) replay(data *store) error {
 			return a.trimTail(offset)
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("AOF at offset %d: %w", offset, err)
 		}
-		length := binary.BigEndian.Uint32(header[:4])
-		if crc32.ChecksumIEEE(header[:8]) != binary.BigEndian.Uint32(header[8:]) || length > maxRequestBytes || length < 4 {
-			return fmt.Errorf("corrupt AOF record header at offset %d", offset)
-		}
-		payload := make([]byte, int(length))
-		if _, err := io.ReadFull(a.file, payload); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return a.trimTail(offset)
-			}
-			return err
-		}
-		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[4:8]) {
-			return fmt.Errorf("corrupt AOF record payload at offset %d", offset)
-		}
-		args, err := decodeRecord(payload)
-		if err != nil || !isWrite(args[0]) || data.execute(args).kind != ':' {
+		if !isWrite(args[0]) || data.execute(args).kind != ':' {
 			return fmt.Errorf("invalid AOF command at offset %d", offset)
 		}
-		offset += int64(len(header)) + int64(length)
+		offset += size
 	}
 }
 
@@ -125,6 +132,13 @@ func (a *aof) trimTail(offset int64) error {
 }
 
 func (a *aof) append(args []string) error {
+	if err := writeRecord(a.file, args); err != nil {
+		return err
+	}
+	return a.file.Sync()
+}
+
+func writeRecord(w io.Writer, args []string) error {
 	var payload bytes.Buffer
 	binary.Write(&payload, binary.BigEndian, uint32(len(args)))
 	for _, arg := range args {
@@ -138,13 +152,31 @@ func (a *aof) append(args []string) error {
 	binary.BigEndian.PutUint32(header[:4], uint32(payload.Len()))
 	binary.BigEndian.PutUint32(header[4:8], crc32.ChecksumIEEE(payload.Bytes()))
 	binary.BigEndian.PutUint32(header[8:], crc32.ChecksumIEEE(header[:8]))
-	if err := writeFull(a.file, header[:]); err != nil {
+	if err := writeFull(w, header[:]); err != nil {
 		return err
 	}
-	if err := writeFull(a.file, payload.Bytes()); err != nil {
-		return err
+	return writeFull(w, payload.Bytes())
+}
+
+func readRecord(r io.Reader) ([]string, int64, error) {
+	// Protect the length itself, so corrupt lengths cannot masquerade as tails.
+	var header [12]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, 0, err
 	}
-	return a.file.Sync()
+	length := binary.BigEndian.Uint32(header[:4])
+	if crc32.ChecksumIEEE(header[:8]) != binary.BigEndian.Uint32(header[8:]) || length > maxRequestBytes || length < 4 {
+		return nil, 0, errors.New("corrupt record header")
+	}
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, 0, incomplete(err)
+	}
+	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[4:8]) {
+		return nil, 0, errors.New("corrupt record payload")
+	}
+	args, err := decodeRecord(payload)
+	return args, int64(len(header)) + int64(length), err
 }
 
 func writeFull(w io.Writer, p []byte) error {

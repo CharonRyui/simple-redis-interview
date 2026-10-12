@@ -9,10 +9,13 @@ import (
 // store owns all Hash data. Returned responses are independent of its maps.
 // A single lock covers each complete command, including multi-field writes.
 type store struct {
-	mu       sync.RWMutex
-	hashes   map[string]map[string]string
-	journal  journal
-	writeErr error
+	mu        sync.RWMutex
+	hashes    map[string]map[string]string
+	journal   journal
+	writeErr  error
+	usedBytes int64
+	maxBytes  int64              // zero means unlimited; this is accounting, not process RSS
+	save      func(*store) error // called while holding the write lock
 }
 
 func newStore() *store {
@@ -27,6 +30,20 @@ func (s *store) execute(args []string) response {
 	argc := len(args)
 	valid := false
 	switch cmd {
+	case "SAVE":
+		if argc != 1 {
+			return failure("ERR wrong number of arguments for 'save' command")
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.writeErr != nil || s.save == nil {
+			return failure("MISCONF snapshot unavailable")
+		}
+		if err := s.save(s); err != nil {
+			log.Printf("snapshot failed: %v", err)
+			return failure("ERR snapshot save failed")
+		}
+		return response{kind: '+', text: "OK"}
 	case "PING":
 		if argc == 1 {
 			return response{kind: '+', text: "PONG"}
@@ -58,6 +75,9 @@ func (s *store) execute(args []string) response {
 		if s.writeErr != nil {
 			return failure("MISCONF persistence unavailable; writes disabled until restart")
 		}
+		if cmd == "HSET" && s.maxBytes > 0 && s.usedBytes+s.hsetDelta(args) > s.maxBytes {
+			return failure("OOM storage limit exceeded")
+		}
 		if s.journal != nil {
 			if err := s.journal.append(args); err != nil {
 				s.writeErr = err
@@ -73,6 +93,7 @@ func (s *store) execute(args []string) response {
 	hash := s.hashes[args[1]]
 	switch cmd {
 	case "HSET":
+		s.usedBytes += s.hsetDelta(args)
 		if hash == nil {
 			hash = make(map[string]string)
 			s.hashes[args[1]] = hash
@@ -98,12 +119,14 @@ func (s *store) execute(args []string) response {
 	case "HDEL":
 		deleted := 0
 		for _, field := range args[2:] {
-			if _, exists := hash[field]; exists {
+			if value, exists := hash[field]; exists {
+				s.usedBytes -= fieldBytes(field, value)
 				delete(hash, field)
 				deleted++
 			}
 		}
-		if len(hash) == 0 {
+		if len(hash) == 0 && hash != nil {
+			s.usedBytes -= keyBytes(args[1])
 			delete(s.hashes, args[1])
 		}
 		return integer(deleted)
@@ -118,7 +141,11 @@ func (s *store) execute(args []string) response {
 	case "DEL":
 		deleted := 0
 		for _, key := range args[1:] {
-			if _, exists := s.hashes[key]; exists {
+			if hash, exists := s.hashes[key]; exists {
+				s.usedBytes -= keyBytes(key)
+				for field, value := range hash {
+					s.usedBytes -= fieldBytes(field, value)
+				}
 				delete(s.hashes, key)
 				deleted++
 			}
